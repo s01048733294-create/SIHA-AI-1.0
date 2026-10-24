@@ -583,9 +583,9 @@ function crossCheck(plan, files) {
 }
 
 // ---- SIHA Galaxy: 시스템 통째로 생성 (설계 -> 파일별 코드 -> 자동 검사 -> 필요하면 자동 수정) ----
-async function aiText(env, messages, maxTokens) {
+async function aiText(env, messages, maxTokens, models) {
   let lastErr = null;
-  for (const model of MODELS) {
+  for (const model of (models || MODELS)) {
     try {
       const msgs = model.includes("qwen3")
         ? messages.map((m, i) => (i === messages.length - 1 ? { ...m, content: m.content + " /no_think" } : m))
@@ -603,11 +603,33 @@ async function aiText(env, messages, maxTokens) {
   throw lastErr || new Error("빈 답변");
 }
 
+// 잘리거나 앞뒤에 말이 붙은 JSON도 최대한 살려서 읽는다
+function loosePlanJson(text) {
+  const clean = String(text || "").replace(/```(?:json)?/gi, "");
+  const a = clean.indexOf("{");
+  if (a < 0) return null;
+  const t = clean.slice(a);
+  const tries = [];
+  const last = t.lastIndexOf("}");
+  if (last > 0) tries.push(t.slice(0, last + 1));
+  const k = t.lastIndexOf("},");
+  if (k > 0) tries.push(t.slice(0, k + 1) + "]}");
+  if (last > 0) { tries.push(t.slice(0, last + 1) + "]}"); tries.push(t.slice(0, last + 1) + "}"); tries.push(t.slice(0, last + 1) + "]}}"); }
+  for (const x of tries) {
+    try { const p = JSON.parse(x); if (p && Array.isArray(p.files)) return p; } catch (_) {}
+  }
+  return null;
+}
+
+function defaultFile(hint) {
+  return UI_WANT.test(hint || "")
+    ? { name: "UIController", type: "LocalScript", location: "StarterPlayer.StarterPlayerScripts", purpose: "화면(SihaUI)을 찾아 열기·닫기와 서버 연결 로직을 붙이는 클라이언트 스크립트" }
+    : { name: "Main", type: "Script", location: "ServerScriptService", purpose: String(hint || "요청한 기능을 구현하는 서버 스크립트").slice(0, 150) };
+}
+
 function parsePlan(text) {
-  const a = text.indexOf("{"), b = text.lastIndexOf("}");
-  if (a < 0 || b <= a) return null;
-  let p;
-  try { p = JSON.parse(text.slice(a, b + 1)); } catch (_) { return null; }
+  const p = loosePlanJson(text);
+  if (!p) return null;
   if (!p || !Array.isArray(p.files)) return null;
   const TYPES = { script: "Script", localscript: "LocalScript", modulescript: "ModuleScript" };
   const files = [];
@@ -621,7 +643,7 @@ function parsePlan(text) {
       purpose: String(f.purpose || "").slice(0, 200),
     });
   }
-  if (!files.length) return null;
+  if (!files.length) files.push(defaultFile(String(p.title || "") + " " + String(p.summary || "")));
   const arr = (v) => (Array.isArray(v) ? v.map((x) => String(x).slice(0, 200)).slice(0, 10) : []);
   return {
     title: String(p.title || "시스템").slice(0, 60),
@@ -839,11 +861,18 @@ async function handleSystem(request, env) {
       '{"title":"시스템 이름","summary":"한두 문장 설명","files":[{"name":"파일 이름","type":"Script 또는 LocalScript 또는 ModuleScript","location":"놓을 위치","purpose":"이 파일의 역할"}],"objects":["미리 Studio에서 만들어 둘 오브젝트와 이름과 종류 (예: ReplicatedStorage 안의 RemoteEvent \'BuyItem\')"],"steps":["설치 순서 한 줄씩"]}\n' +
       "규칙: 파일은 2개 이상 5개 이하. 돈, 아이템, 저장 같은 중요한 로직은 서버 Script에 두고 클라이언트는 입력과 화면만 맡겨. 파일끼리 공유하는 RemoteEvent 같은 이름은 objects에 정확히 적어. JSON 밖에는 아무것도 쓰지 마.";
     let plan = null;
-    for (let i = 0; i < 2 && !plan; i++) {
-      const t = await aiText(env, [{ role: "system", content: planSys + (UI_WANT.test(message) ? UI_PLAN_NOTE : "") }, { role: "user", content: message }], 1200);
+    const PLAN_ONLY = "너는 로블록스 시스템 설계 도구야. 사용자 요청을 설계해서 오직 JSON 하나만 출력해. 설명·코드블록·인사 금지.\n형식: " +
+      '{"title":"시스템 이름","summary":"한두 문장","files":[{"name":"파일 이름","type":"Script|LocalScript|ModuleScript","location":"놓을 위치","purpose":"역할"}],"objects":["미리 만들어 둘 오브젝트 (예: ReplicatedStorage 안의 RemoteEvent \'BuyItem\')"],"steps":["설치 순서"]}\n' +
+      "규칙: 파일 2~5개. 돈·아이템·저장 같은 중요한 로직은 서버 Script, 클라이언트는 입력과 화면만. 파일끼리 공유하는 이름은 objects에 정확히 적어.";
+    const extra = UI_WANT.test(message) ? UI_PLAN_NOTE : "";
+    const CODER_FIRST = [MODELS[1], MODELS[0], MODELS[2]];
+    for (let i = 0; i < 3 && !plan; i++) {
+      const sys = (i === 0 ? planSys : PLAN_ONLY) + extra;
+      const t = await aiText(env, [{ role: "system", content: sys }, { role: "user", content: message }], 2500, i === 2 ? CODER_FIRST : undefined);
       plan = parsePlan(t);
+      if (!plan) console.log("plan parse failed (try " + (i + 1) + "):", String(t).slice(0, 200));
     }
-    if (!plan) return json({ detail: "설계를 만들지 못했어. 요청을 조금 더 구체적으로 적어서 다시 시도해 줘." }, 500);
+    if (!plan) plan = { title: message.replace(/\s+/g, " ").slice(0, 40) || "시스템", summary: "", objects: [], steps: [], files: [defaultFile(message)] }; // 설계가 계속 실패해도 멈추지 않고 기본 구성으로 진행
     const ui = await makeUi(env, message, plan);
     const uiHint = ui ? uiHintText(ui) : "";
     const files = await Promise.all(plan.files.map((f) => writeFile(env, message, plan, f, uiHint).catch((e) => {
